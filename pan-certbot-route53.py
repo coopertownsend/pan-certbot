@@ -36,7 +36,7 @@ if os.path.exists(PAN_CREDS):
 
 PAN_IP       = os.getenv('PAN_IP')
 API_KEY      = os.getenv('PAN_API_KEY')
-DOMAIN       = 'vpn.yourdomain.com'
+DOMAIN       = 'vpn.intragreat.com'
 SSL_PROFILE  = DOMAIN
 CERT_PATH    = f'/etc/letsencrypt/live/{DOMAIN}/fullchain.pem'
 KEY_PATH     = f'/etc/letsencrypt/live/{DOMAIN}/privkey.pem'
@@ -157,12 +157,10 @@ def import_to_pan(name, passp, certf, keyf):
         print(r.text)
 
 def main():
-    # print live certbot cert
     print_cert_details(CERT_PATH, "CERTBOT BEFORE")
     issuer = local_cert_issuer(CERT_PATH)
     print("[INFO] Certbot live cert issuer:", issuer)
 
-    # if this is a staging cert, also show the most recent production one
     if "STAGING" in issuer:
         cf, kf = find_existing_production_cert()
         if cf and kf:
@@ -172,11 +170,9 @@ def main():
         else:
             print("[WARN] No production cert found in archive to check.")
 
-    # connect to PAN
     print("[INFO] Connecting to PAN…")
     xapi = PanXapi(hostname=PAN_IP, api_key=API_KEY, timeout=30)
 
-    # locate GlobalProtect profile
     base = ("/config/devices/entry[@name='localhost.localdomain']"
             "/vsys/entry[@name='vsys1']/global-protect")
     portal_xp  = base + f"/global-protect-portal/entry[@name='{DOMAIN}']"
@@ -190,7 +186,6 @@ def main():
         print("[ERROR] no portal/gateway profile found")
         return
 
-    # fetch PAN's current cert & expiry
     pan_cert = pan_get_text(xapi,
         f"/config/shared/ssl-tls-service-profile/entry[@name='{prof}']",
         'certificate'
@@ -199,7 +194,6 @@ def main():
     print(f"[INFO] PAN using cert '{pan_cert}'", end='')
     print(f", expires {pan_exp}" if pan_exp else "")
 
-    # get PAN fingerprint
     pan_fp = None
     if pan_cert:
         tmp = fetch_pan_cert_file(pan_cert)
@@ -208,14 +202,12 @@ def main():
         print(f"[INFO] PAN SHA256 Fingerprint: {pan_fp}")
         os.unlink(tmp)
 
-    # ─── production vs staging decision ───────────────────────────────────
     if USE_STAGING:
         run_certbot(staging=True)
         cert_file, key_file = CERT_PATH, KEY_PATH
         local_dt = local_cert_expiry(CERT_PATH)
         local_fp = cert_fingerprint_sha256(cert_file)
     else:
-        # find latest production archive
         cf, kf = find_existing_production_cert()
         if cf and kf:
             prod_dt = local_cert_expiry(cf)
@@ -224,50 +216,64 @@ def main():
         else:
             prod_dt = prod_fp = prod_days = None
 
-        # compare live vs prod
         live_fp = cert_fingerprint_sha256(CERT_PATH)
         live_dt = local_cert_expiry(CERT_PATH)
 
         if prod_fp is None:
             should_renew = True
             print("[INFO] No production archive found; will renew.")
-        elif live_fp != prod_fp:
+        elif "Let's Encrypt" not in issuer:
             should_renew = True
-            print("[INFO] Live cert != archived production; will renew.")
+            print("[INFO] Live cert is from staging; will renew.")
         elif prod_days is not None and prod_days <= DAYS_BEFORE:
             should_renew = True
             print(f"[INFO] Production cert expires in {prod_days} days ≤ threshold; will renew.")
         else:
             should_renew = False
-            print(f"[INFO] Production cert is fresh ({prod_days} days left); no renewal.")
+            print(f"[INFO] Live cert is valid and from production. {prod_days} days left — no renewal.")
 
         if should_renew:
+            pre_fingerprint = live_fp
+            pre_expiry = live_dt
             try:
                 run_certbot(staging=False)
-                cert_file, key_file = CERT_PATH, KEY_PATH
-                local_dt = local_cert_expiry(CERT_PATH)
-                local_fp = cert_fingerprint_sha256(cert_file)
-                print("[INFO] Obtained new production certificate.")
             except subprocess.CalledProcessError:
-                if cf and kf:
-                    cert_file, key_file = cf, kf
-                    local_dt = prod_dt
-                    local_fp = prod_fp
-                    print("[WARN] Renewal failed; using last archived production cert.")
-                else:
-                    cert_file, key_file = CERT_PATH, KEY_PATH
-                    local_dt = live_dt
-                    local_fp = live_fp
-                    print("[WARN] Renewal failed and no archive; using live cert.")
+                print("[WARN] Certbot renewal failed. Checking if cert was still updated.")
+            post_fingerprint = cert_fingerprint_sha256(CERT_PATH)
+            post_expiry = local_cert_expiry(CERT_PATH)
+
+            if pre_fingerprint != post_fingerprint or (prod_dt and post_expiry > prod_dt):
+                cert_file, key_file = CERT_PATH, KEY_PATH
+                local_dt = post_expiry
+                local_fp = post_fingerprint
+                print("[INFO] Cert changed or newer despite Certbot error — using updated cert.")
+            elif cf and kf:
+                cert_file, key_file = cf, kf
+                local_dt = prod_dt
+                local_fp = prod_fp
+                print("[WARN] Renewal failed; using last archived production cert.")
+            else:
+                cert_file, key_file = CERT_PATH, KEY_PATH
+                local_dt = pre_expiry
+                local_fp = pre_fingerprint
+                print("[WARN] Renewal failed and no archive; using live cert.")
         else:
-            cert_file, key_file = cf, kf
-            local_dt = prod_dt
-            local_fp = prod_fp
+
+            if live_dt and prod_dt and live_dt > prod_dt:
+                print("[INFO] Live cert is newer than archived production cert — using live.")
+                cert_file, key_file = CERT_PATH, KEY_PATH
+                local_dt = live_dt
+                local_fp = live_fp
+            else:
+                print("[INFO] Using archived production cert.")
+                cert_file, key_file = cf, kf
+                local_dt = prod_dt
+                local_fp = prod_fp
+
 
     local_name = versioned_name(local_dt)
     print(f"[INFO] Local cert version → '{local_name}', expires {local_dt}")
 
-    # decide whether to import
     if USE_STAGING:
         need = True
         print("[INFO] Staging mode: forcing cert replace on PAN.")
@@ -285,7 +291,6 @@ def main():
     if not need:
         return
 
-    # import, bind, commit
     passp = generate_passphrase()
     import_to_pan(local_name, passp, cert_file, key_file)
 
@@ -302,7 +307,6 @@ def main():
     print(f"[INFO] Sleeping {PAN_COMMIT_SLEEP_DURATION}s for commit to apply…")
     time.sleep(PAN_COMMIT_SLEEP_DURATION)
 
-    # final verification
     new_cert = pan_get_text(xapi,
       f"/config/shared/ssl-tls-service-profile/entry[@name='{prof}']",
       'certificate'
@@ -315,3 +319,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
